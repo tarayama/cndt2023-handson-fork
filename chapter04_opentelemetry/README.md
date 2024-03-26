@@ -463,7 +463,7 @@ Jaegerは以前までは`jaeger`プロトコルを利用していましたが、
 
 
 ログの時と同様に、OpenTelemetryCollectorリソースを利用してKubernetesにデプロイします。
-今回はトレースデータの取得先ホスト上のメトリクスを取得するエージェントとして動作させる想定なため、`.spec.mode`にはdeploymentを指定し、Deploymentとして起動します。
+今回はトレースデータの取得先ホスト上のメトリクスを取得するエージェントとして動作させる想定なため、`.spec.mode`にはdaemonsetを指定し、DaemonSetとして起動します。
 最後に、OpenTelemetry Collectorの設定を`.spec.config`に行っておきます。
 
 ```yaml
@@ -472,7 +472,7 @@ kind: OpenTelemetryCollector
 metadata:
   name: trace-collector
 spec:
-  mode: "deployment"
+  mode: "daemonset"
   config: |
     receivers:
       otlp:
@@ -496,7 +496,7 @@ spec:
           exporters: [debug, otlp]
 ```
 
-OpenTelemetryCollectorリソースをデプロイすると、自動的にDeploymentとPodが起動していることがわかります。
+OpenTelemetryCollectorリソースをデプロイすると、自動的にDaemonSetとPodが起動していることがわかります。
 また、OTLPを受け付ける口として、Serviceも作成されています。
 
 ```sh
@@ -504,7 +504,7 @@ kubectl apply -f manifests/trace-collector.yaml
 ```
 ```sh
 # 実行結果
-opentelemetrycollector/metrics-collector created
+opentelemetrycollector/trace-collector created
 ```
 
 ```sh
@@ -512,23 +512,24 @@ kubectl get opentelemetrycollector trace-collector
 ```
 ```sh
 # 実行結果
-NAME              MODE         VERSION   READY   AGE   IMAGE                                         MANAGEMENT
-trace-collector   deployment   0.87.0    1/1     10m   otel/opentelemetry-collector-contrib:0.87.0   managed
+NAME              MODE         VERSION   READY   AGE   IMAGE   MANAGEMENT
+trace-collector   daemonset    0.87.0            10m           managed
 ```
 ```sh
-kubectl get deployments,pods,services -l app.kubernetes.io/name=trace-collector-collector
+kubectl get daemonset,pods,services -l app.kubernetes.io/name=trace-collector-collector
 ```
 ```sh
 # 実行結果
-NAME                                        READY   UP-TO-DATE   AVAILABLE   AGE
-deployment.apps/trace-collector-collector   1/1     1            1           10m
+NAME                                       DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+daemonset.apps/trace-collector-collector   2         2         2       2            2           <none>          28m
 
-NAME                                             READY   STATUS    RESTARTS   AGE
-pod/trace-collector-collector-5bbc5d7c47-jtscf   2/2     Running   0          88s
+NAME                                  READY   STATUS    RESTARTS   AGE
+pod/trace-collector-collector-csr9k   1/1     Running   0          10m
+pod/trace-collector-collector-rvx7w   1/1     Running   0          10m
 
-NAME                                         TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)    AGE
-service/trace-collector-collector            ClusterIP   10.96.172.252   <none>        4317/TCP   10m
-service/trace-collector-collector-headless   ClusterIP   None            <none>        4317/TCP   10m
+NAME                                         TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE
+service/trace-collector-collector            ClusterIP   10.96.157.88   <none>        4317/TCP   28m
+service/trace-collector-collector-headless   ClusterIP   None           <none>        4317/TCP   28m
 ```
 
 
@@ -599,7 +600,7 @@ sample-app-blue-5fb8dc75fd-7cvxg   2/2     Ready    0          30s
 
 次に、実際にJaeger上からメトリクスを確認してみましょう。
 まず、`http://app.example.com/` に接続し、一定量のトレースデータを出力します。
-`https://jaeger.example.com/explore` に接続し、Service名に`sample-app-blue`を指定してみると、トレースデータが確認できます。
+`http://jaeger.example.com/explore` に接続し、Service名に`sample-app-blue`を指定してみると、トレースデータが確認できます。
 今回は複雑なマイクロサービスではないため、シンプルな表示になっていますが、サービス間の通信がある場合はもう少し複雑なトレースデータを確認することができます。
 
 ![](./image/jaeger.png)
@@ -634,3 +635,94 @@ Prosessorではメモリ制限・サンプリング・バッチ処理などを�
 [推奨されるProcessor](https://github.com/open-telemetry/opentelemetry-collector/tree/main/processor#recommended-processors)については、Docsを確認してください。
 
 
+## Traceのおまけ編(Java実装)
+
+以下の手順でJava向けに`Instrumentation`リソースの設定を行います。
+テレメトリーの経路はGoの場合と同様です。
+
+```yaml
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: java-instrumentation
+  namespace: handson
+spec:
+  exporter:
+    endpoint: http://trace-collector-collector.default:4317
+  propagators:
+    - tracecontext
+    - baggage
+  sampler:
+    type: parentbased_traceidratio
+    argument: "1"
+```
+
+```shell
+kubectl apply -f manifests/java-instrumentation.yaml
+```
+
+サンプルのJavaアプリをデプロイします。
+今回はDeploymentにアノテーションが付いているいるのでpatchは不要です。
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: handson
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+      annotations:
+        instrumentation.opentelemetry.io/inject-java: "java-instrumentation"
+    spec: {...}
+```
+
+```shell
+kubectl apply -f manifests/deployment.yaml
+```
+
+作成されたPodを確認すると、`bff-xxx`と`backend-xxx`が立ち上がっています。
+
+```bash
+kubectl -n handson get pods
+```
+```bash
+# 実行結果
+NAME                            READY   STATUS    RESTARTS   AGE
+backend-85cd7fc5c7-dlfjx        1/1     Running   0          46m
+bff-fcd8c68dc-qf2cj             1/1     Running   0          29m
+```
+
+サンプルのアプリに対応した`Service`, `Ingress`をデプロイします。
+
+```shell
+kubectl apply -f manifests/service.yaml
+kubectl apply -f manifests/ingress.yaml
+```
+
+```bash
+kubectl -n handson get svc,ingress
+```
+
+```bash
+# 実行結果
+NAME              TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE
+service/backend   ClusterIP   10.96.144.18   <none>        8080/TCP   3h54m
+service/bff       ClusterIP   10.96.152.92   <none>        8080/TCP   3h54m
+service/handson   ClusterIP   10.96.31.46    <none>        8080/TCP   29d
+
+NAME                                              CLASS   HOSTS             ADDRESS         PORTS   AGE
+ingress.networking.k8s.io/app-ingress-by-nginx    nginx   app.example.com   10.96.225.194   80      163m
+ingress.networking.k8s.io/java-ingress-by-nginx   nginx   app.example.com   10.96.225.194   80      3h54m
+```
+
+次に、実際にJaeger上からメトリクスを確認してみましょう。
+まず、`http://app.example.com/bff` に接続し、一定量のトレースデータを出力します。
+`http://jaeger.example.com/explore` に接続し、Service名に`bff`を指定してみると、トレースデータが確認できます。
